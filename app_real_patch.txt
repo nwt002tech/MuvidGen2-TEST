@@ -1,0 +1,7 @@
+# --- Add this at the bottom of app_real.py ---
+def render():
+    """Entry point for Streamlit app. Move your current UI code here."""
+    pass
+
+if __name__ == "__main__":
+    render()
