@@ -142,7 +142,7 @@ def hf_txt2img(prompt: str, hf_token: str, model_id: str = "stabilityai/sdxl-tur
 def fallback_card(text: str, size=(768,512)):
     w, h = size
     bg = Image.new("RGB", size, (16, 22, 54))
-    grad = Image new("RGBA", size)
+    grad = Image.new("RGBA", size)
     # We'll keep it simple to avoid PIL edge-cases
     draw = ImageDraw.Draw(bg)
     try:
