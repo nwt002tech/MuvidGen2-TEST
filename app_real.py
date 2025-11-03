@@ -1,4 +1,5 @@
-import os, re, io, uuid, time, tempfile, logging, sys
+
+import os, re, io, uuid, time, tempfile, logging, sys, subprocess, math
 from dataclasses import dataclass
 from typing import List
 import numpy as np
@@ -13,11 +14,12 @@ def log(msg: str):
     try: st.sidebar.write(f"🧭 {msg}")
     except Exception: pass
 
-_STOP = set(x.strip() for x in """a an and are as at be by for from has he her his i in is it its of on that the they this to was were will with
-me my our ours us we youre you\'re im ive ill ya yo oh uh um your ur nah yeah yes no not do does did done have
-has had am been being or if so than then there here when where why how what which who whom about into through
-over under again further once
-""".split())
+_STOP = set(x.strip() for x in (
+    "a an and are as at be by for from has he her his i in is it its of on that the they this to was were will with "
+    "me my our ours us we youre you're im ive ill ya yo oh uh um your ur nah yeah yes no not do does did done have "
+    "has had am been being or if so than then there here when where why how what which who whom about into through "
+    "over under again further once"
+).split())
 
 def simple_keywords(text: str, top_k: int = 12) -> List[str]:
     words = re.findall(r"[A-Za-z]{3,}", (text or "").lower())
@@ -39,7 +41,7 @@ class AudioAnalysis:
 
 def _st_energy_onsets(y: np.ndarray, sr: int, frame_len_s=0.046, hop_s=0.023):
     if y.ndim > 1: y = y.mean(axis=1)
-    y = y.astype(np.float32)
+    y = y.astype(np.float32, copy=False)
     peak = float(np.max(np.abs(y)) + 1e-9); y = y / peak
     frame_len = max(1, int(frame_len_s * sr)); hop = max(1, int(hop_s * sr))
     n_frames = 1 + max(0, (len(y) - frame_len) // hop)
@@ -50,7 +52,7 @@ def _st_energy_onsets(y: np.ndarray, sr: int, frame_len_s=0.046, hop_s=0.023):
         if seg.size == 0: seg = np.zeros(1, np.float32)
         energies[i] = float(np.sqrt(np.mean(seg**2)))
     if n_frames >= 5:
-        energies = np.convolve(energies, np.ones(5)/5, mode="same")
+        energies = np.convolve(energies, np.ones(5, dtype=np.float32)/5, mode="same")
     onset = np.maximum(0, np.diff(energies, prepend=energies[:1]))
     return onset, hop / sr
 
@@ -60,7 +62,8 @@ def _peak_pick(onset: np.ndarray, hop_sec: float) -> List[float]:
     peaks = []; min_gap = int(max(1, 0.2 / max(hop_sec, 1e-6))); last = -min_gap
     for i, val in enumerate(onset):
         if val > thr and (i - last) >= min_gap:
-            if val >= onset[max(0,i-2):i+3].max():
+            window = onset[max(0,i-2):i+3]
+            if val >= window.max():
                 peaks.append(i); last = i
     return [float(p * hop_sec) for p in peaks]
 
@@ -76,24 +79,57 @@ def _estimate_bpm(beat_times: List[float]) -> float:
     if bpm > 200: bpm *= 0.5
     return float(bpm)
 
+def _ffmpeg_pcm(path: str, sr: int = 44100) -> np.ndarray:
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", path, "-ac", "1", "-ar", str(sr),
+        "-f", "f32le", "pipe:1"
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate()
+    if proc.returncode != 0 or out is None:
+        raise RuntimeError(f"FFmpeg decode failed: {err.decode('utf-8', 'ignore')}")
+    audio = np.frombuffer(out, dtype=np.float32)
+    return audio
+
 def analyze_audio(file_bytes: bytes, sr_target: int = 44100) -> AudioAnalysis:
-    log("Audio: using MoviePy (FFmpeg)")
-    from moviepy.editor import AudioFileClip
     with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
         tmp.write(file_bytes); tmp.flush(); path = tmp.name
-    with AudioFileClip(path) as ac:
-        duration = float(ac.duration or 0.0)
-        y = ac.to_soundarray(fps=sr_target)
-    if y.ndim > 1: y = y.mean(axis=1)
+
+    duration = 0.0; y = None
+
+    try:
+        from moviepy.editor import AudioFileClip
+        log("Audio: trying MoviePy loader")
+        with AudioFileClip(path) as ac:
+            duration = float(ac.duration or 0.0)
+            try:
+                y_arr = ac.to_soundarray(fps=sr_target)
+                if y_arr is not None and len(y_arr) > 0:
+                    y = y_arr if y_arr.ndim == 1 else y_arr.mean(axis=1)
+            except Exception as e:
+                log(f"MoviePy to_soundarray failed: {e}")
+    except Exception as e:
+        log(f"MoviePy loader failed: {e}")
+
+    if y is None or len(y) == 0:
+        log("Audio: using FFmpeg pipe fallback")
+        y = _ffmpeg_pcm(path, sr=sr_target)
+        duration = float(len(y) / float(sr_target))
+
     onset, hop_sec = _st_energy_onsets(y, sr_target)
     peaks = _peak_pick(onset, hop_sec)
+
     if len(peaks) < 4 and duration > 4 and onset.size > 32:
-        f = np.fft.rfft(onset - onset.mean()); acf = np.fft.irfft(f * np.conj(f))
+        f = np.fft.rfft(onset - onset.mean())
+        acf = np.fft.irfft(f * np.conj(f))
         acf[:int(0.2/hop_sec)] = 0
         lag = int(np.argmax(acf[:int(2.0/hop_sec)]))
-        est_int = max(0.5, min(1.0, lag * hop_sec)); beat_times = list(np.arange(0, duration, est_int))
+        est_int = max(0.5, min(1.0, lag * hop_sec))
+        beat_times = list(np.arange(0, duration, est_int))
     else:
         beat_times = peaks
+
     bpm = _estimate_bpm(beat_times)
     log(f"Audio analyzed: duration={duration:.2f}s bpm≈{bpm:.1f} beats={len(beat_times)}")
     return AudioAnalysis(duration=duration, tempo_bpm=bpm, beat_times=[float(t) for t in beat_times])
@@ -121,12 +157,11 @@ def build_prompt(line: str, tags: List[str], global_kw: List[str], style: StyleS
 
 def hf_txt2img(prompt: str, hf_token: str, model_id: str = "stabilityai/sdxl-turbo", width=768, height=512, steps=6, guidance=3.0):
     from PIL import Image
-    import requests, io, time
+    import requests
     try:
         url = f"https://api-inference.huggingface.co/models/{model_id}"
         headers = {"Authorization": f"Bearer {hf_token}"}
         payload = {"inputs": prompt, "parameters": {"width": width, "height": height, "num_inference_steps": steps, "guidance_scale": guidance}}
-        print(f"HF call → model={model_id}", flush=True)
         r = requests.post(url, headers=headers, json=payload, timeout=120)
         if r.status_code == 200 and r.headers.get("content-type","").startswith("image/"):
             return Image.open(io.BytesIO(r.content)).convert("RGB")
@@ -135,55 +170,79 @@ def hf_txt2img(prompt: str, hf_token: str, model_id: str = "stabilityai/sdxl-tur
             r2 = requests.post(url, headers=headers, json=payload, timeout=120)
             if r2.status_code == 200 and r2.headers.get("content-type","").startswith("image/"):
                 return Image.open(io.BytesIO(r2.content)).convert("RGB")
-        print(f"HF fail: status={r.status_code} ct={r.headers.get('content-type','')}", flush=True); return None
-    except Exception as e:
-        print(f"HF exception: {e}", flush=True); return None
+        return None
+    except Exception:
+        return None
 
 def fallback_card(text: str, size=(768,512)):
     w, h = size
     bg = Image.new("RGB", size, (16, 22, 54))
-    grad = Image.new("RGBA", size)
-    # We'll keep it simple to avoid PIL edge-cases
+    overlay = Image.new("RGBA", size, (0,0,0,0))
+    od = ImageDraw.Draw(overlay)
+    for i in range(h):
+        alpha = int(160 * (1 - i / h))
+        od.line([(0,i),(w,i)], fill=(79,70,229,alpha))
+    bg.paste(overlay, (0,0), overlay)
     draw = ImageDraw.Draw(bg)
     try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 24)
+        title_font = ImageFont.truetype("DejaVuSans.ttf", 28)
+        body_font  = ImageFont.truetype("DejaVuSans.ttf", 22)
     except:
-        font = ImageFont.load_default()
-    draw.text((20, 20), "Pixar-inspired Scene", fill=(255,255,255), font=font)
-    draw.text((20, 60), text[:160], fill=(220,230,255), font=font)
+        title_font = body_font = ImageFont.load_default()
+    title = "Pixar-inspired Scene"
+    tw = draw.textlength(title, font=title_font)
+    draw.text(((w - tw)//2, 20), title, fill=(255,255,255), font=title_font)
+    # wrap
+    words = text.split()
+    lines = []
+    cur = ""
+    for wd in words:
+        test = wd if not cur else f"{cur} {wd}"
+        if draw.textlength(test, font=body_font) < (w - 80):
+            cur = test
+        else:
+            lines.append(cur); cur = wd
+    if cur: lines.append(cur)
+    y = 80
+    for ln in lines[:5]:
+        draw.text((40, y), ln, fill=(230,235,255), font=body_font)
+        y += 28
     return bg
 
 def subtitle_clip(text: str, width: int, height: int, duration: float):
     from PIL import Image, ImageDraw, ImageFont
     from moviepy.editor import ImageClip
-    import numpy as np
     pad_h = 20; box_h = 110
     img = Image.new("RGBA", (width, height), (0,0,0,0)); draw = ImageDraw.Draw(img)
     draw.rectangle([(0, height - box_h - pad_h), (width, height)], fill=(0,0,0,130))
-    words = text.split(); lines, cur = [], []; max_chars = max(10, int(width/20))
-    for w_ in words:
-        cur.append(w_)
-        if len(" ".join(cur)) > max_chars:
-            lines.append(" ".join(cur)); cur = []
-    if cur: lines.append(" ".join(cur))
     try: font = ImageFont.truetype("DejaVuSans.ttf", 36)
     except: font = ImageFont.load_default()
+    words = text.split()
+    lines = []
+    cur = ""
+    for wd in words:
+        test = wd if not cur else f"{cur} {wd}"
+        if draw.textlength(test, font=font) < (width - 120):
+            cur = test
+        else:
+            lines.append(cur); cur = wd
+    if cur: lines.append(cur)
     y = height - box_h - pad_h + 20
+    from moviepy.editor import ImageClip
     for ln in lines[:3]:
-        bbox = draw.textbbox((0,0), ln, font=font); tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
-        draw.text(((width - tw)//2, y), ln, font=font, fill=(255,255,255,255)); y += th + 6
+        tw = draw.textlength(ln, font=font)
+        draw.text(((width - tw)//2, y), ln, font=font, fill=(255,255,255,255))
+        y += 42
     return ImageClip(np.array(img)).set_duration(duration).set_position(("center","center"))
 
 def ken_burns(image, duration: float, zoom: float = 1.1):
     from moviepy.editor import ImageClip
     from moviepy.video.fx.all import resize
-    import numpy as np
     clip = ImageClip(np.array(image)).set_duration(duration)
-    return clip.fx(resize, lambda t: 1 + (zoom - 1) * (t / duration))
+    return clip.fx(resize, lambda t: 1 + (zoom - 1) * (t / max(duration, 1e-6)))
 
 def assemble_video(images: List, lines: List[str], audio_path: str, beat_times: List[float], total_duration: float, scene_pad: float = 0.15):
     from moviepy.editor import AudioFileClip, CompositeVideoClip, concatenate_videoclips
-    import numpy as np, tempfile, uuid, os
     log("MoviePy render starting")
     width, height = images[0].size
     n = max(1, len(lines)); target_seg = total_duration / n
@@ -215,15 +274,6 @@ def human_seconds(sec: float) -> str:
     m = int(sec // 60); s = int(round(sec % 60)); return f"{m}:{s:02d}"
 
 def render():
-    st.markdown("""
-    <style>
-    button[kind="primary"] { font-size: 1.05rem; padding: 0.7rem 1rem; }
-    .block-container { padding-top: 1rem; padding-bottom: 2rem; }
-    textarea, input, select { font-size: 1rem !important; }
-    @media (max-width: 420px) { .stActionButton { transform: scale(1.05); } }
-    </style>
-    """, unsafe_allow_html=True)
-
     st.title("🎬 MuVidGen — Pixar-Inspired 3D (No‑Pandas)")
     with st.sidebar:
         st.header("Settings")
@@ -232,8 +282,8 @@ def render():
             st.caption("✅ Using Hugging Face token from Streamlit secrets.")
         else:
             st.caption("ℹ️ No HF token found — will use stylized fallback images.")
-        model_id = st.text_input("HF Image Model ID", value="stabilityai/sdxl-turbo")
         force_fallback = st.toggle("Force fallback (skip HF calls)", value=False)
+        model_id = st.text_input("HF Image Model ID", value="stabilityai/sdxl-turbo")
 
         st.divider(); st.subheader("Visual Style (Pixar-Inspired)")
         visual_style = st.text_area("Base style", value="Pixar-inspired 3D animation, stylized kid-friendly characters, soft studio lighting, GI, SSS, PBR materials, cinematic DOF, soft rim light, vibrant but clean color, wholesome mood", height=90)
@@ -290,12 +340,12 @@ def render():
         st.markdown("#### 3) Scene Generation (Pixar-Inspired 3D)")
         st.caption("Creating per-line scenes via HF Inference (or stylized fallback).")
         gen_progress = st.progress(0); images: List[Image.Image] = []; total = max(1, len(lines))
+        token = (st.secrets.get("HF_TOKEN","") or "").strip()
         for i, line in enumerate(lines):
             prompt = build_prompt(line, tags[i] if i < len(tags) else [], kws, style)
             img = None
-            token = (st.secrets.get("HF_TOKEN","") or "").strip()
             if token and not st.session_state.get("force_fallback", False):
-                img = hf_txt2img(prompt, token, model_id="stabilityai/sdxl-turbo")
+                img = hf_txt2img(prompt, token, model_id)
             if img is None: img = fallback_card(line)
             images.append(img); gen_progress.progress(int(((i+1)/total)*100))
             if (i+1) % max(1, total//3) == 0 or (i+1) == total:
