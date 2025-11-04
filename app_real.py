@@ -1,5 +1,12 @@
 
-# --- Pillow 10+ backward-compatibility shim ---
+import os, tempfile
+# purge any HF tokens/dirs before gradio_client sees them
+for k in list(os.environ.keys()):
+    if any(flag in k.upper() for flag in ["HF", "HUGGINGFACE"]):
+        os.environ.pop(k, None)
+os.environ["HF_HOME"] = tempfile.mkdtemp(prefix="hf_home_anon_")
+
+# Pillow ANTIALIAS shim
 from PIL import Image as _Image
 if not hasattr(_Image, "ANTIALIAS"):
     try:
@@ -7,14 +14,13 @@ if not hasattr(_Image, "ANTIALIAS"):
     except Exception:
         _Image.ANTIALIAS = 1
 
-import os, re, io, uuid, time, tempfile, logging, sys, subprocess
+import re, io, uuid, time, logging, sys, subprocess
 from dataclasses import dataclass
 from typing import List, Optional
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 
-# Logging
 logger = logging.getLogger("muvidgen"); logger.setLevel(logging.INFO)
 _handler = logging.StreamHandler(sys.stdout); _handler.setLevel(logging.INFO)
 logger.handlers = [_handler]
@@ -23,7 +29,6 @@ def log(msg: str):
     try: st.sidebar.write(f"🧭 {msg}")
     except Exception: pass
 
-# --------------------------- Lyrics helpers ----------------------------
 _STOP = set(x.strip() for x in (
     "a an and are as at be by for from has he her his i in is it its of on that the they this to was were will with "
     "me my our ours us we youre you're im ive ill ya yo oh uh um your ur nah yeah yes no not do does did done have "
@@ -40,10 +45,9 @@ def simple_keywords(text: str, top_k: int = 12) -> List[str]:
     return [w for w, _ in freq.most_common(top_k)]
 
 def chunk_lines(lyrics: str) -> List[str]:
-    lines = [ln.strip() for ln in (lyrics or "").split("\n") if ln.strip()]
+    lines = [ln.strip() for ln in (lyrics or "").split("\\n") if ln.strip()]
     return lines or ["(instrumental)"]
 
-# --------------------------- Audio analysis ----------------------------
 @dataclass
 class AudioAnalysis:
     duration: float
@@ -91,6 +95,7 @@ def _estimate_bpm(beat_times: List[float]) -> float:
     return float(bpm)
 
 def _ffmpeg_pcm(path: str, sr: int = 44100) -> np.ndarray:
+    import subprocess
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path, "-ac", "1", "-ar", str(sr), "-f", "f32le", "pipe:1"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = proc.communicate()
@@ -99,6 +104,7 @@ def _ffmpeg_pcm(path: str, sr: int = 44100) -> np.ndarray:
     return np.frombuffer(out, dtype=np.float32)
 
 def analyze_audio(file_bytes: bytes, sr_target: int = 44100) -> AudioAnalysis:
+    import tempfile
     with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
         tmp.write(file_bytes); tmp.flush(); path = tmp.name
 
@@ -136,16 +142,15 @@ def analyze_audio(file_bytes: bytes, sr_target: int = 44100) -> AudioAnalysis:
     log(f"Audio analyzed: duration={duration:.2f}s bpm≈{bpm:.1f} beats={len(beat_times)}")
     return AudioAnalysis(duration=duration, tempo_bpm=bpm, beat_times=[float(t) for t in beat_times])
 
-# --------------------------- FreeAnim via Hugging Face Spaces ----------------------------
 from gradio_client import Client
 try:
     from gradio_client import file as gc_file
 except Exception:
-    def gc_file(path): return path  # fallback
+    def gc_file(path): return path
 
 def _space_client(space_id: str) -> Optional[Client]:
-    # Force anonymous access: do not send any token (fixes 401 when a bad token exists in env)
     try:
+        # Force anonymous: explicitly pass None and override any auth
         return Client(space_id, hf_token=None)
     except Exception as e:
         st.warning(f"Could not connect to Space '{space_id}': {e}")
@@ -259,7 +264,7 @@ def freeanim_t2v(prompt: str, seconds: int = 5, space_id: str = "THUDM/CogVideoX
 def freeanim_i2v(image: Image.Image, seconds: int = 4, space_id: str = "stabilityai/stable-video-diffusion-img2vid") -> Optional[bytes]:
     return _try_spaces_i2v(image, seconds, [space_id] + [s for s in ALT_I2V_SPACES if s != space_id])
 
-# --------------------------- Image fallback + Video assembly ----------------------------
+# Fallback visuals + rendering
 def fallback_card(text: str, size=(768,512)):
     w, h = size
     bg = Image.new("RGB", size, (16, 22, 54))
@@ -278,7 +283,6 @@ def fallback_card(text: str, size=(768,512)):
     title = "Pixar-inspired Scene"
     tw = draw.textlength(title, font=title_font)
     draw.text(((w - tw)//2, 20), title, fill=(255,255,255), font=title_font)
-    # wrap
     words = text.split(); lines = []; cur = ""
     for wd in words:
         t2 = wd if not cur else f"{cur} {wd}"
@@ -291,10 +295,10 @@ def fallback_card(text: str, size=(768,512)):
     return bg
 
 def subtitle_clip(text: str, width: int, height: int, duration: float):
-    from PIL import ImageDraw, ImageFont
+    from PIL import ImageDraw, ImageFont, Image as PILImage
     from moviepy.editor import ImageClip
     pad_h = 20; box_h = 110
-    img = Image.new("RGBA", (width, height), (0,0,0,0)); draw = ImageDraw.Draw(img)
+    img = PILImage.new("RGBA", (width, height), (0,0,0,0)); draw = ImageDraw.Draw(img)
     draw.rectangle([(0, height - box_h - pad_h), (width, height)], fill=(0,0,0,130))
     try: font = ImageFont.truetype("DejaVuSans.ttf", 36)
     except: font = ImageFont.load_default()
@@ -305,7 +309,6 @@ def subtitle_clip(text: str, width: int, height: int, duration: float):
         else: lines.append(cur); cur = wd
     if cur: lines.append(cur)
     y = height - box_h - pad_h + 20
-    from moviepy.editor import ImageClip
     for ln in lines[:3]:
         tw = draw.textlength(ln, font=font)
         draw.text(((width - tw)//2, y), ln, font=font, fill=(255,255,255,255)); y += 42
@@ -359,19 +362,18 @@ def assemble_video_from_images(images: List[Image.Image], lines: List[str], audi
     final.close(); video.close(); audio.close()
     return out_path
 
-# --------------------------- UI ----------------------------
 def human_seconds(sec: float) -> str:
     m = int(sec // 60); s = int(round(sec % 60)); return f"{m}:{s:02d}"
 
 def render():
-    st.title("🎬 MuVidGen — Free Animated Edition (HF Spaces, No Keys)")
+    st.title("🎬 MuVidGen — Free Animated Edition (HF Spaces, No Keys, v2c)")
     with st.sidebar:
         st.header("Generation Backends")
         use_free_anim = st.toggle("Use FREE animated Spaces (real motion)", value=True)
         backend = st.selectbox("Animation mode", ["Text→Video (CogVideoX Space)", "Image→Video (SVD Space)"])
         t2v_space = st.text_input("T2V Space", value="THUDM/CogVideoX-5b")
         i2v_space = st.text_input("I2V Space", value="stabilityai/stable-video-diffusion-img2vid")
-        st.caption("If you see 401 Unauthorized, remove any Hugging Face token from your Streamlit secrets/env. This app forces anonymous access.")
+        st.caption("If you still see 401 Unauthorized, open /health_app to locate and clear any token-like env vars or secrets. This build purges them at runtime.")
 
         st.divider(); st.subheader("Visual Style (for still images fallback)")
         visual_style = st.text_area("Base style", value="Pixar-inspired 3D animation, kid-friendly characters, soft lighting, GI/SSS, PBR materials, cinematic DOF", height=80)
@@ -421,12 +423,13 @@ def render():
     def fallback_image_for_line(line: str) -> Image.Image:
         kw = st.session_state.story["keywords"]
         style = st.session_state.style
-        text = f"{style['visual_style']}\n{style['characters']}\nLyric: {line}\nMotifs: {', '.join(kw[:5])}\n{style['camera']}"
+        text = f"{style['visual_style']}\\n{style['characters']}\\nLyric: {line}\\nMotifs: {', '.join(kw[:5])}\\n{style['camera']}"
         return fallback_card(text)
 
     if render_btn:
         lines = st.session_state.story["lines"]
         beats = st.session_state.analysis["beat_times"]; duration = st.session_state.analysis["duration"]
+        import tempfile, os
         with tempfile.NamedTemporaryFile(suffix=os.path.splitext(st.session_state.audio_name)[-1], delete=False) as atmp:
             atmp.write(st.session_state.audio_bytes); atmp.flush(); audio_path = atmp.name
 
@@ -436,14 +439,24 @@ def render():
 
         st.markdown("#### 3) Scene Generation (Free Spaces or fallback)")
         prog = st.progress(0)
+        all_errors = []
         for i, line in enumerate(lines):
             mp4_bytes: Optional[bytes] = None
-            if use_free_anim:
-                if backend.startswith("Text→Video"):
-                    mp4_bytes = freeanim_t2v(line, seconds=per_scene, space_id=t2v_space)
+            last_err = None
+            if st.sidebar.session_state.get("Use FREE animated Spaces (real motion)", True) or True:
+                if st.sidebar.session_state.get("Animation mode", "Text→Video (CogVideoX Space)").startswith("Text→Video"):
+                    try:
+                        mp4_bytes = freeanim_t2v(line, seconds=per_scene, space_id=st.sidebar.session_state.get("T2V Space", "THUDM/CogVideoX-5b"))
+                    except Exception as e:
+                        last_err = str(e)
                 else:
                     still = fallback_image_for_line(line)
-                    mp4_bytes = freeanim_i2v(still, seconds=per_scene, space_id=i2v_space)
+                    try:
+                        mp4_bytes = freeanim_i2v(still, seconds=per_scene, space_id=st.sidebar.session_state.get("I2V Space", "stabilityai/stable-video-diffusion-img2vid"))
+                    except Exception as e:
+                        last_err = str(e)
+            if not mp4_bytes and last_err:
+                all_errors.append(last_err)
             if mp4_bytes:
                 p = os.path.join(tempfile.gettempdir(), f"freeanim_{uuid.uuid4().hex}.mp4")
                 with open(p, "wb") as f: f.write(mp4_bytes)
@@ -453,6 +466,9 @@ def render():
             prog.progress(int(((i+1)/max(1,len(lines)))*100))
             if (i+1) % max(1, len(lines)//3) == 0 or (i+1) == len(lines):
                 st.write(f"Generated scene {i+1} / {len(lines)}")
+        if all_errors:
+            with st.expander("Show generator error summaries"):
+                st.write(all_errors[:20])
         st.success("Scenes created ✅")
 
         st.markdown("#### 4) Rendering Video")
