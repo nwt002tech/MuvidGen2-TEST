@@ -1,22 +1,21 @@
+import os, tempfile, re, uuid, logging, sys
+from dataclasses import dataclass
+from typing import List, Optional
 
-import os, tempfile
-# purge any HF tokens/dirs before gradio_client sees them
+# Kill any HF tokens -> anonymous only
 for k in list(os.environ.keys()):
-    if any(flag in k.upper() for flag in ["HF", "HUGGINGFACE"]):
+    if "HF" in k.upper() or "HUGGINGFACE" in k.upper():
         os.environ.pop(k, None)
 os.environ["HF_HOME"] = tempfile.mkdtemp(prefix="hf_home_anon_")
 
 # Pillow ANTIALIAS shim
-from PIL import Image as _Image
-if not hasattr(_Image, "ANTIALIAS"):
+from PIL import Image as _PIL_Image
+if not hasattr(_PIL_Image, "ANTIALIAS"):
     try:
-        _Image.ANTIALIAS = _Image.Resampling.LANCZOS
+        _PIL_Image.ANTIALIAS = _PIL_Image.Resampling.LANCZOS
     except Exception:
-        _Image.ANTIALIAS = 1
+        _PIL_Image.ANTIALIAS = 1
 
-import re, io, uuid, time, logging, sys, subprocess
-from dataclasses import dataclass
-from typing import List, Optional
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
@@ -28,6 +27,18 @@ def log(msg: str):
     logger.info(msg)
     try: st.sidebar.write(f"🧭 {msg}")
     except Exception: pass
+
+FREE_SPACES = {
+    "t2v": [
+        "zai-org/CogVideoX-5B-Space",
+        "THUDM/CogVideoX-5B-Space",
+        "ai-forever/kandinsky-4-t2v-flash",
+    ],
+    "i2v": [
+        "multimodalart/stable-video-diffusion",
+        "K00B404/AnimateDiff-Lightning",
+    ],
+}
 
 _STOP = set(x.strip() for x in (
     "a an and are as at be by for from has he her his i in is it its of on that the they this to was were will with "
@@ -45,7 +56,7 @@ def simple_keywords(text: str, top_k: int = 12) -> List[str]:
     return [w for w, _ in freq.most_common(top_k)]
 
 def chunk_lines(lyrics: str) -> List[str]:
-    lines = [ln.strip() for ln in (lyrics or "").split("\\n") if ln.strip()]
+    lines = [ln.strip() for ln in (lyrics or "").split("\n") if ln.strip()]
     return lines or ["(instrumental)"]
 
 @dataclass
@@ -96,18 +107,14 @@ def _estimate_bpm(beat_times: List[float]) -> float:
 
 def _ffmpeg_pcm(path: str, sr: int = 44100) -> np.ndarray:
     import subprocess
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path, "-ac", "1", "-ar", str(sr), "-f", "f32le", "pipe:1"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate()
-    if proc.returncode != 0 or out is None:
-        raise RuntimeError(f"FFmpeg decode failed: {err.decode('utf-8', 'ignore')}")
+    cmd = ["ffmpeg","-hide_banner","-loglevel","error","-i", path, "-ac","1","-ar",str(sr),"-f","f32le","pipe:1"]
+    out = subprocess.check_output(cmd)
     return np.frombuffer(out, dtype=np.float32)
 
 def analyze_audio(file_bytes: bytes, sr_target: int = 44100) -> AudioAnalysis:
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
         tmp.write(file_bytes); tmp.flush(); path = tmp.name
-
     duration = 0.0; y = None
     try:
         from moviepy.editor import AudioFileClip
@@ -122,17 +129,14 @@ def analyze_audio(file_bytes: bytes, sr_target: int = 44100) -> AudioAnalysis:
                 log(f"MoviePy to_soundarray failed: {e}")
     except Exception as e:
         log(f"MoviePy loader failed: {e}")
-
     if y is None or len(y) == 0:
         log("Audio: using FFmpeg pipe fallback")
         y = _ffmpeg_pcm(path, sr=sr_target)
         duration = float(len(y) / float(sr_target))
-
     onset, hop_sec = _st_energy_onsets(y, sr_target)
     peaks = _peak_pick(onset, hop_sec)
     if len(peaks) < 4 and duration > 4 and onset.size > 32:
-        f = np.fft.rfft(onset - onset.mean())
-        acf = np.fft.irfft(f * np.conj(f))
+        f = np.fft.rfft(onset - onset.mean()); acf = np.fft.irfft(f * np.conj(f))
         acf[:int(0.2/hop_sec)] = 0
         lag = int(np.argmax(acf[:int(2.0/hop_sec)]))
         est_int = max(0.5, min(1.0, lag * hop_sec)); beat_times = list(np.arange(0, duration, est_int))
@@ -143,10 +147,6 @@ def analyze_audio(file_bytes: bytes, sr_target: int = 44100) -> AudioAnalysis:
     return AudioAnalysis(duration=duration, tempo_bpm=bpm, beat_times=[float(t) for t in beat_times])
 
 from gradio_client import Client
-try:
-    from gradio_client import file as gc_file
-except Exception:
-    def gc_file(path): return path
 
 def _space_client(space_id: str):
     try:
@@ -159,7 +159,9 @@ def _first_predict_endpoint(meta: dict, want_image: bool=False, want_text: bool=
     apis = meta.get("endpoints", []) or meta.get("named_endpoints", [])
     if isinstance(apis, dict):
         for name, schema in apis.items():
-            inputs = (schema.get("inputs") if isinstance(schema.get("inputs"), list) else []) if isinstance(schema, dict) else []
+            if not isinstance(schema, dict): 
+                continue
+            inputs = schema.get("inputs") if isinstance(schema.get("inputs"), list) else []
             types = [i.get("type","") for i in inputs if isinstance(i, dict)]
             if want_text and any(t in ("textbox","text","string") for t in types): return name
             if want_image and any(t in ("image","filepath","numpy","pil") for t in types): return name
@@ -173,16 +175,6 @@ def _first_predict_endpoint(meta: dict, want_image: bool=False, want_text: bool=
         if want_text and any(t in ("textbox","text","string") for t in types): return name
         if want_image and any(t in ("image","filepath","numpy","pil") for t in types): return name
     return None
-
-ALT_T2V_SPACES = [
-    "THUDM/CogVideoX-5b",
-    "ali-vilab/InstructVideo",
-    "kandinsky-community/video-kandinsky",
-]
-ALT_I2V_SPACES = [
-    "stabilityai/stable-video-diffusion-img2vid",
-    "ByteDance/AnimateDiff-Lightning",
-]
 
 def _try_spaces_t2v(prompt: str, seconds: int, space_ids: List[str]):
     for sid in space_ids:
@@ -221,7 +213,7 @@ def _try_spaces_t2v(prompt: str, seconds: int, space_ids: List[str]):
     return None
 
 def _try_spaces_i2v(image: Image.Image, seconds: int, space_ids: List[str]):
-    import tempfile, uuid, os
+    import tempfile, os
     tmp_img = os.path.join(tempfile.gettempdir(), f"svd_{uuid.uuid4().hex}.png")
     image.save(tmp_img)
     for sid in space_ids:
@@ -258,15 +250,26 @@ def _try_spaces_i2v(image: Image.Image, seconds: int, space_ids: List[str]):
                 continue
     return None
 
-def freeanim_t2v(prompt: str, seconds: int = 5, space_id: str = "THUDM/CogVideoX-5b"):
-    try_list = [space_id] + [s for s in ALT_T2V_SPACES if s != space_id]
+def freeanim_t2v(prompt: str, seconds: int = 5, space_id: Optional[str] = None, candidates: Optional[List[str]] = None):
+    try_list: List[str] = []
+    if space_id: try_list.append(space_id)
+    if candidates: 
+        for s in candidates:
+            if s not in try_list: try_list.append(s)
+    if not try_list:
+        try_list = FREE_SPACES["t2v"]
     return _try_spaces_t2v(prompt, seconds, try_list)
 
-def freeanim_i2v(image: Image.Image, seconds: int = 4, space_id: str = "stabilityai/stable-video-diffusion-img2vid"):
-    try_list = [space_id] + [s for s in ALT_I2V_SPACES if s != space_id]
+def freeanim_i2v(image: Image.Image, seconds: int = 4, space_id: Optional[str] = None, candidates: Optional[List[str]] = None):
+    try_list: List[str] = []
+    if space_id: try_list.append(space_id)
+    if candidates: 
+        for s in candidates:
+            if s not in try_list: try_list.append(s)
+    if not try_list:
+        try_list = FREE_SPACES["i2v"]
     return _try_spaces_i2v(image, seconds, try_list)
 
-# Fallback visuals + rendering
 def fallback_card(text: str, size=(768,512)):
     w, h = size
     bg = Image.new("RGB", size, (16, 22, 54))
@@ -368,32 +371,49 @@ def human_seconds(sec: float) -> str:
     m = int(sec // 60); s = int(round(sec % 60)); return f"{m}:{s:02d}"
 
 def render():
-    st.title("🎬 MuVidGen — Free Animated Edition (HF Spaces, No Keys, v2d)")
+    st.title("🎬 MuVidGen — Free Animated Edition (v2e)")
     with st.sidebar:
         st.header("Generation Backends")
         use_free_anim = st.toggle("Use FREE animated Spaces (real motion)", value=True)
-        backend = st.selectbox("Animation mode", ["Text→Video (CogVideoX Space)", "Image→Video (SVD Space)"])
-        t2v_space = st.text_input("T2V Space", value="THUDM/CogVideoX-5b")
-        i2v_space = st.text_input("I2V Space", value="stabilityai/stable-video-diffusion-img2vid")
-        st.caption("If you still see 401 Unauthorized, open /health_app to locate and clear any token-like env vars or secrets. This build purges them at runtime.")
-        # mirror into session_state
-        st.session_state['use_free_anim'] = use_free_anim
-        st.session_state['anim_mode'] = backend
-        st.session_state['t2v_space'] = t2v_space
-        st.session_state['i2v_space'] = i2v_space
+        backend = st.selectbox("Animation mode", ["Text→Video (T2V)", "Image→Video (I2V)"])
+        t2v_space = st.text_input("Preferred T2V Space (optional)", value="")
+        i2v_space = st.text_input("Preferred I2V Space (optional)", value="")
+        auto_pick_live = st.toggle("Auto-pick live Spaces at start", value=True)
+        st.caption("Anonymous mode only — no tokens. If Spaces are gated/down, the app falls back to beat-synced stills.")
 
-        st.divider(); st.subheader("Visual Style (for still images fallback)")
-        visual_style = st.text_area("Base style", value="Pixar-inspired 3D animation, kid-friendly characters, soft lighting, GI/SSS, PBR materials, cinematic DOF", height=80)
-        characters = st.text_input("Characters", value="Cute anthropomorphic letters and happy kids dancing; big expressive eyes, rounded shapes")
-        palette = st.text_input("Palette", value="pastels with pops of yellow, teal, magenta; warm key, cool fill")
-        camera = st.text_input("Camera", value="35mm lens, gentle dolly, slow zoom-in, soft rim light")
-        model_hint = st.text_input("Hint", value="family-safe, cheerful, consistent stylization")
-        character_bible = st.text_area("Character Bible", value="Green letter F (forward-hook top curve), friendly face; classroom setting.", height=80)
-        negative_hint = st.text_input("Avoid", value="no text, no watermark, no logo, no scary, no copyrighted characters")
+        st.session_state["use_free_anim"] = use_free_anim
+        st.session_state["anim_mode"] = backend
+        st.session_state["t2v_space"] = (t2v_space.strip() or None)
+        st.session_state["i2v_space"] = (i2v_space.strip() or None)
+        st.session_state["auto_pick_live"] = auto_pick_live
+
+        st.divider(); st.subheader("Visual Style (fallback stills)")
+        visual_style = st.text_area("Base style", value="Pixar-inspired 3D animation, kid-friendly characters, soft lighting, GI/SSS, PBR", height=80)
+        characters = st.text_input("Characters", value="Cute anthropomorphic letters and happy kids dancing")
+        palette = st.text_input("Palette", value="pastels with pops of yellow, teal, magenta")
+        camera = st.text_input("Camera", value="35mm lens, gentle dolly, soft rim light")
+        model_hint = st.text_input("Hint", value="family-safe, cheerful, consistent style")
+        character_bible = st.text_area("Character Bible", value="Green letter F with forward-hook top curve; Pixar-like.", height=80)
+        negative_hint = st.text_input("Avoid", value="no text, no watermark, no scary")
 
     st.markdown("#### 1) Upload audio and paste lyrics")
     audio_file = st.file_uploader("Upload song (MP3/WAV/M4A/AAC)", type=["mp3","wav","m4a","aac"])
     lyrics = st.text_area("Paste full song lyrics", height=200, placeholder="One lyric line per scene.")
+
+    from space_pinger import prioritize_live_spaces
+    if "space_lists" not in st.session_state or st.session_state.get("auto_pick_live"):
+        t2v_list = FREE_SPACES["t2v"][:]
+        i2v_list = FREE_SPACES["i2v"][:]
+        if st.session_state.get("t2v_space") and st.session_state["t2v_space"] not in t2v_list:
+            t2v_list.insert(0, st.session_state["t2v_space"])
+        if st.session_state.get("i2v_space") and st.session_state["i2v_space"] not in i2v_list:
+            i2v_list.insert(0, st.session_state["i2v_space"])
+        live_t2v, logs_t2v = prioritize_live_spaces(t2v_list)
+        live_i2v, logs_i2v = prioritize_live_spaces(i2v_list)
+        st.session_state["space_lists"] = {"t2v": live_t2v, "i2v": live_i2v, "logs": logs_t2v + logs_i2v}
+
+    with st.expander("Space pinger logs (live first)"):
+        st.write(st.session_state["space_lists"].get("logs", []))
 
     colA, colB = st.columns(2)
     if "analysis" not in st.session_state: st.session_state.analysis = None
@@ -413,8 +433,6 @@ def render():
                         low = re.findall(r"[A-Za-z]+", ln.lower())
                         t = [w for w in low if w in kw]
                         if any(w in low for w in ["dance","dancin","dancing","groove","move","twist","spin","clap","jump"]): t.append("dancing")
-                        if any(w in low for w in ["sun","sunshine","day","bright","yellow"]): t.append("daytime")
-                        if any(w in low for w in ["moon","night","stars","glow"]): t.append("night")
                         tags.append(sorted(list(set(t))))
                 st.session_state.analysis = {"duration": ana.duration, "tempo_bpm": ana.tempo_bpm, "beat_times": ana.beat_times}
                 st.session_state.story = {"lines": lines, "keywords": list(kw), "line_tags": tags}
@@ -422,7 +440,8 @@ def render():
                 st.session_state.style = {"visual_style": visual_style, "characters": characters, "palette": palette, "camera": camera, "model_hint": model_hint, "character_bible": character_bible, "negative_hint": negative_hint}
                 st.success("Analysis complete ✅")
                 st.write(f"**Duration:** {human_seconds(ana.duration)}  |  **Tempo:** {round(ana.tempo_bpm)} BPM  |  **Detected beats:** {len(ana.beat_times)}")
-                st.write("**Top lyric keywords:**", ", ".join(kw))
+                st.write("**Top lyric keywords:** " + ", ".join(kw))
+
     with colB:
         ready = st.session_state.get("analysis") is not None
         render_btn = st.button("Generate Full Music Video", type="primary", use_container_width=True, disabled=not ready)
@@ -430,36 +449,40 @@ def render():
     def fallback_image_for_line(line: str) -> Image.Image:
         kw = st.session_state.story["keywords"]
         style = st.session_state.style
-        text = f"{style['visual_style']}\\n{style['characters']}\\nLyric: {line}\\nMotifs: {', '.join(kw[:5])}\\n{style['camera']}"
+        text = f"{style['visual_style']}\n{style['characters']}\nLyric: {line}\nMotifs: {', '.join(kw[:5])}\n{style['camera']}"
         return fallback_card(text)
 
+    from typing import Tuple
     if render_btn:
         lines = st.session_state.story["lines"]
         beats = st.session_state.analysis["beat_times"]; duration = st.session_state.analysis["duration"]
-        import tempfile, os, uuid
+        import tempfile, os
         with tempfile.NamedTemporaryFile(suffix=os.path.splitext(st.session_state.audio_name)[-1], delete=False) as atmp:
             atmp.write(st.session_state.audio_bytes); atmp.flush(); audio_path = atmp.name
 
         clip_paths: List[str] = []
         images: List[Image.Image] = []
-        per_scene = max(4, min(10, int(duration/max(1,len(lines)))))  # 4-10s
+        per_scene = max(4, min(10, int(duration/max(1,len(lines)))))
 
         st.markdown("#### 3) Scene Generation (Free Spaces or fallback)")
         prog = st.progress(0)
-        all_errors = []
+        all_errors: List[str] = []
+        t2v_list = st.session_state["space_lists"]["t2v"]
+        i2v_list = st.session_state["space_lists"]["i2v"]
+
         for i, line in enumerate(lines):
             mp4_bytes: Optional[bytes] = None
             last_err = None
-            if st.session_state.get('use_free_anim', True) or True:
-                if st.session_state.get('anim_mode', 'Text→Video (CogVideoX Space)').startswith('Text→Video'):
+            if st.session_state.get("use_free_anim", True):
+                if st.session_state.get("anim_mode","Text→Video (T2V)").startswith("Text→Video"):
                     try:
-                        mp4_bytes = freeanim_t2v(line, seconds=per_scene, space_id=st.session_state.get('t2v_space', 'THUDM/CogVideoX-5b'))
+                        mp4_bytes = freeanim_t2v(line, seconds=per_scene, space_id=None, candidates=t2v_list)
                     except Exception as e:
                         last_err = str(e)
                 else:
                     still = fallback_image_for_line(line)
                     try:
-                        mp4_bytes = freeanim_i2v(still, seconds=per_scene, space_id=st.session_state.get('i2v_space', 'stabilityai/stable-video-diffusion-img2vid'))
+                        mp4_bytes = freeanim_i2v(still, seconds=per_scene, space_id=None, candidates=i2v_list)
                     except Exception as e:
                         last_err = str(e)
             if not mp4_bytes and last_err:

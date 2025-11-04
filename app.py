@@ -1,5 +1,5 @@
 import streamlit as st
-st.set_page_config(page_title="MuVidGen — Free Animated Edition", layout="wide")
+st.set_page_config(page_title="MuVidGen — Free Animated Edition (v2e)", layout="wide")
 try:
     import app_real as app
     if hasattr(app, "render") and callable(app.render):
