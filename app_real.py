@@ -144,8 +144,9 @@ except Exception:
     def gc_file(path): return path  # fallback
 
 def _space_client(space_id: str) -> Optional[Client]:
+    # Force anonymous access: do not send any token (fixes 401 when a bad token exists in env)
     try:
-        return Client(space_id)
+        return Client(space_id, hf_token=None)
     except Exception as e:
         st.warning(f"Could not connect to Space '{space_id}': {e}")
         return None
@@ -169,78 +170,94 @@ def _first_predict_endpoint(meta: dict, want_image: bool=False, want_text: bool=
         if want_image and any(t in ("image","filepath","numpy","pil") for t in types): return name
     return None
 
-def freeanim_t2v(prompt: str, seconds: int = 5, space_id: str = "THUDM/CogVideoX-5b") -> Optional[bytes]:
-    c = _space_client(space_id)
-    if not c: return None
-    try:
-        meta = c.view_api(all_endpoints=True)
-    except Exception as e:
-        st.warning(f"Space API introspection failed: {e}")
-        meta = {}
-    endpoint = _first_predict_endpoint(meta if isinstance(meta, dict) else {}, want_text=True) or "/predict"
-    candidates = [
-        {"prompt": prompt, "num_frames": min(125, max(50, seconds*25)), "fps": 25, "seed": 0},
-        {"text": prompt, "num_frames": min(125, max(50, seconds*25)), "fps": 20, "seed": 0},
-        {"prompt": prompt},
-    ]
-    for payload in candidates:
+ALT_T2V_SPACES = [
+    "THUDM/CogVideoX-5b",
+    "ali-vilab/InstructVideo",
+    "kandinsky-community/video-kandinsky",
+]
+ALT_I2V_SPACES = [
+    "stabilityai/stable-video-diffusion-img2vid",
+    "ByteDance/AnimateDiff-Lightning",
+]
+
+def _try_spaces_t2v(prompt: str, seconds: int, space_ids: List[str]) -> Optional[bytes]:
+    for sid in space_ids:
+        c = _space_client(sid)
+        if not c: continue
         try:
-            res = c.predict(api_name=endpoint, **payload)
-            vid_path = None
-            if isinstance(res, (list, tuple)):
-                for x in res:
-                    if isinstance(x, str) and x.lower().endswith((".mp4",".webm",".mov")):
-                        vid_path = x; break
-            elif isinstance(res, dict):
-                for v in res.values():
-                    if isinstance(v, str) and v.lower().endswith((".mp4",".webm",".mov")):
-                        vid_path = v; break
-            elif isinstance(res, str):
-                if res.lower().endswith((".mp4",".webm",".mov")):
-                    vid_path = res
-            if vid_path:
-                local = c.download(vid_path)
-                with open(local, "rb") as f: return f.read()
+            meta = c.view_api(all_endpoints=True)
         except Exception:
-            continue
+            meta = {}
+        endpoint = _first_predict_endpoint(meta if isinstance(meta, dict) else {}, want_text=True) or "/predict"
+        candidates = [
+            {"prompt": prompt, "num_frames": min(125, max(50, seconds*25)), "fps": 25, "seed": 0},
+            {"text": prompt, "num_frames": min(125, max(50, seconds*25)), "fps": 20, "seed": 0},
+            {"prompt": prompt},
+        ]
+        for payload in candidates:
+            try:
+                res = c.predict(api_name=endpoint, **payload)
+                vid_path = None
+                if isinstance(res, (list, tuple)):
+                    for x in res:
+                        if isinstance(x, str) and x.lower().endswith((".mp4",".webm",".mov")):
+                            vid_path = x; break
+                elif isinstance(res, dict):
+                    for v in res.values():
+                        if isinstance(v, str) and v.lower().endswith((".mp4",".webm",".mov")):
+                            vid_path = v; break
+                elif isinstance(res, str):
+                    if res.lower().endswith((".mp4",".webm",".mov")):
+                        vid_path = res
+                if vid_path:
+                    local = c.download(vid_path)
+                    with open(local, "rb") as f: return f.read()
+            except Exception:
+                continue
     return None
 
-def freeanim_i2v(image: Image.Image, seconds: int = 4, space_id: str = "stabilityai/stable-video-diffusion-img2vid") -> Optional[bytes]:
-    c = _space_client(space_id)
-    if not c: return None
-    try:
-        meta = c.view_api(all_endpoints=True)
-    except Exception as e:
-        st.warning(f"Space API introspection failed: {e}")
-        meta = {}
-    endpoint = _first_predict_endpoint(meta if isinstance(meta, dict) else {}, want_image=True) or "/predict"
+def _try_spaces_i2v(image: Image.Image, seconds: int, space_ids: List[str]) -> Optional[bytes]:
     tmp_img = os.path.join(tempfile.gettempdir(), f"svd_{uuid.uuid4().hex}.png")
     image.save(tmp_img)
-    candidates = [
-        {"image": gc_file(tmp_img), "fps": 12, "motion_bucket_id": 64, "seed": 0},
-        {"image": gc_file(tmp_img)},
-    ]
-    for payload in candidates:
+    for sid in space_ids:
+        c = _space_client(sid)
+        if not c: continue
         try:
-            res = c.predict(api_name=endpoint, **payload)
-            vid_path = None
-            if isinstance(res, (list, tuple)):
-                for x in res:
-                    if isinstance(x, str) and x.lower().endswith((".mp4",".webm",".mov")):
-                        vid_path = x; break
-            elif isinstance(res, dict):
-                for v in res.values():
-                    if isinstance(v, str) and v.lower().endswith((".mp4",".webm",".mov")):
-                        vid_path = v; break
-            elif isinstance(res, str):
-                if res.lower().endswith((".mp4",".webm",".mov")):
-                    vid_path = res
-            if vid_path:
-                local = c.download(vid_path)
-                with open(local, "rb") as f: return f.read()
+            meta = c.view_api(all_endpoints=True)
         except Exception:
-            continue
+            meta = {}
+        endpoint = _first_predict_endpoint(meta if isinstance(meta, dict) else {}, want_image=True) or "/predict"
+        candidates = [
+            {"image": gc_file(tmp_img), "fps": 12, "motion_bucket_id": 64, "seed": 0},
+            {"image": gc_file(tmp_img)},
+        ]
+        for payload in candidates:
+            try:
+                res = c.predict(api_name=endpoint, **payload)
+                vid_path = None
+                if isinstance(res, (list, tuple)):
+                    for x in res:
+                        if isinstance(x, str) and x.lower().endswith((".mp4",".webm",".mov")):
+                            vid_path = x; break
+                elif isinstance(res, dict):
+                    for v in res.values():
+                        if isinstance(v, str) and v.lower().endswith((".mp4",".webm",".mov")):
+                            vid_path = v; break
+                elif isinstance(res, str):
+                    if res.lower().endswith((".mp4",".webm",".mov")):
+                        vid_path = res
+                if vid_path:
+                    local = c.download(vid_path)
+                    with open(local, "rb") as f: return f.read()
+            except Exception:
+                continue
     return None
+
+def freeanim_t2v(prompt: str, seconds: int = 5, space_id: str = "THUDM/CogVideoX-5b") -> Optional[bytes]:
+    return _try_spaces_t2v(prompt, seconds, [space_id] + [s for s in ALT_T2V_SPACES if s != space_id])
+
+def freeanim_i2v(image: Image.Image, seconds: int = 4, space_id: str = "stabilityai/stable-video-diffusion-img2vid") -> Optional[bytes]:
+    return _try_spaces_i2v(image, seconds, [space_id] + [s for s in ALT_I2V_SPACES if s != space_id])
 
 # --------------------------- Image fallback + Video assembly ----------------------------
 def fallback_card(text: str, size=(768,512)):
@@ -354,7 +371,7 @@ def render():
         backend = st.selectbox("Animation mode", ["Text→Video (CogVideoX Space)", "Image→Video (SVD Space)"])
         t2v_space = st.text_input("T2V Space", value="THUDM/CogVideoX-5b")
         i2v_space = st.text_input("I2V Space", value="stabilityai/stable-video-diffusion-img2vid")
-        st.caption("These are public, free Spaces. They may queue during busy hours.")
+        st.caption("If you see 401 Unauthorized, remove any Hugging Face token from your Streamlit secrets/env. This app forces anonymous access.")
 
         st.divider(); st.subheader("Visual Style (for still images fallback)")
         visual_style = st.text_area("Base style", value="Pixar-inspired 3D animation, kid-friendly characters, soft lighting, GI/SSS, PBR materials, cinematic DOF", height=80)
@@ -421,7 +438,7 @@ def render():
         prog = st.progress(0)
         for i, line in enumerate(lines):
             mp4_bytes: Optional[bytes] = None
-            if st.sidebar.checkbox("Use FREE animated Spaces (toggle)", value=True, key=f"use_anim_{i}"):
+            if use_free_anim:
                 if backend.startswith("Text→Video"):
                     mp4_bytes = freeanim_t2v(line, seconds=per_scene, space_id=t2v_space)
                 else:
