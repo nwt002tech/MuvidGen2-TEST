@@ -1,5 +1,4 @@
 import sys, platform, subprocess, streamlit as st
-
 st.title("MuVidGen Health+ (Diagnostics)")
 st.code({"python": sys.version, "platform": platform.platform()})
 mods = {}
@@ -11,7 +10,6 @@ for m in ["numpy","PIL","moviepy","imageio_ffmpeg","requests","streamlit","gradi
     except Exception as e:
         mods[m] = ["❌", str(e)]
 st.subheader("Python packages"); st.code(mods)
-
 try:
     out = subprocess.check_output(["ffmpeg","-version"], stderr=subprocess.STDOUT, text=True)[:400]
     st.subheader("FFmpeg"); st.code({"ffmpeg":"✅","detail":out})
