@@ -4,3 +4,4 @@ requests==2.32.3
 Pillow==10.4.0
 moviepy==1.0.3
 imageio-ffmpeg==0.5.1
+gradio_client==0.16.4
