@@ -148,15 +148,14 @@ try:
 except Exception:
     def gc_file(path): return path
 
-def _space_client(space_id: str) -> Optional[Client]:
+def _space_client(space_id: str):
     try:
-        # Force anonymous: explicitly pass None and override any auth
         return Client(space_id, hf_token=None)
     except Exception as e:
         st.warning(f"Could not connect to Space '{space_id}': {e}")
         return None
 
-def _first_predict_endpoint(meta: dict, want_image: bool=False, want_text: bool=False) -> Optional[str]:
+def _first_predict_endpoint(meta: dict, want_image: bool=False, want_text: bool=False):
     apis = meta.get("endpoints", []) or meta.get("named_endpoints", [])
     if isinstance(apis, dict):
         for name, schema in apis.items():
@@ -185,7 +184,7 @@ ALT_I2V_SPACES = [
     "ByteDance/AnimateDiff-Lightning",
 ]
 
-def _try_spaces_t2v(prompt: str, seconds: int, space_ids: List[str]) -> Optional[bytes]:
+def _try_spaces_t2v(prompt: str, seconds: int, space_ids: List[str]):
     for sid in space_ids:
         c = _space_client(sid)
         if not c: continue
@@ -221,7 +220,8 @@ def _try_spaces_t2v(prompt: str, seconds: int, space_ids: List[str]) -> Optional
                 continue
     return None
 
-def _try_spaces_i2v(image: Image.Image, seconds: int, space_ids: List[str]) -> Optional[bytes]:
+def _try_spaces_i2v(image: Image.Image, seconds: int, space_ids: List[str]):
+    import tempfile, uuid, os
     tmp_img = os.path.join(tempfile.gettempdir(), f"svd_{uuid.uuid4().hex}.png")
     image.save(tmp_img)
     for sid in space_ids:
@@ -233,8 +233,8 @@ def _try_spaces_i2v(image: Image.Image, seconds: int, space_ids: List[str]) -> O
             meta = {}
         endpoint = _first_predict_endpoint(meta if isinstance(meta, dict) else {}, want_image=True) or "/predict"
         candidates = [
-            {"image": gc_file(tmp_img), "fps": 12, "motion_bucket_id": 64, "seed": 0},
-            {"image": gc_file(tmp_img)},
+            {"image": tmp_img, "fps": 12, "motion_bucket_id": 64, "seed": 0},
+            {"image": tmp_img},
         ]
         for payload in candidates:
             try:
@@ -258,11 +258,13 @@ def _try_spaces_i2v(image: Image.Image, seconds: int, space_ids: List[str]) -> O
                 continue
     return None
 
-def freeanim_t2v(prompt: str, seconds: int = 5, space_id: str = "THUDM/CogVideoX-5b") -> Optional[bytes]:
-    return _try_spaces_t2v(prompt, seconds, [space_id] + [s for s in ALT_T2V_SPACES if s != space_id])
+def freeanim_t2v(prompt: str, seconds: int = 5, space_id: str = "THUDM/CogVideoX-5b"):
+    try_list = [space_id] + [s for s in ALT_T2V_SPACES if s != space_id]
+    return _try_spaces_t2v(prompt, seconds, try_list)
 
-def freeanim_i2v(image: Image.Image, seconds: int = 4, space_id: str = "stabilityai/stable-video-diffusion-img2vid") -> Optional[bytes]:
-    return _try_spaces_i2v(image, seconds, [space_id] + [s for s in ALT_I2V_SPACES if s != space_id])
+def freeanim_i2v(image: Image.Image, seconds: int = 4, space_id: str = "stabilityai/stable-video-diffusion-img2vid"):
+    try_list = [space_id] + [s for s in ALT_I2V_SPACES if s != space_id]
+    return _try_spaces_i2v(image, seconds, try_list)
 
 # Fallback visuals + rendering
 def fallback_card(text: str, size=(768,512)):
@@ -366,7 +368,7 @@ def human_seconds(sec: float) -> str:
     m = int(sec // 60); s = int(round(sec % 60)); return f"{m}:{s:02d}"
 
 def render():
-    st.title("🎬 MuVidGen — Free Animated Edition (HF Spaces, No Keys, v2c)")
+    st.title("🎬 MuVidGen — Free Animated Edition (HF Spaces, No Keys, v2d)")
     with st.sidebar:
         st.header("Generation Backends")
         use_free_anim = st.toggle("Use FREE animated Spaces (real motion)", value=True)
@@ -374,6 +376,11 @@ def render():
         t2v_space = st.text_input("T2V Space", value="THUDM/CogVideoX-5b")
         i2v_space = st.text_input("I2V Space", value="stabilityai/stable-video-diffusion-img2vid")
         st.caption("If you still see 401 Unauthorized, open /health_app to locate and clear any token-like env vars or secrets. This build purges them at runtime.")
+        # mirror into session_state
+        st.session_state['use_free_anim'] = use_free_anim
+        st.session_state['anim_mode'] = backend
+        st.session_state['t2v_space'] = t2v_space
+        st.session_state['i2v_space'] = i2v_space
 
         st.divider(); st.subheader("Visual Style (for still images fallback)")
         visual_style = st.text_area("Base style", value="Pixar-inspired 3D animation, kid-friendly characters, soft lighting, GI/SSS, PBR materials, cinematic DOF", height=80)
@@ -429,7 +436,7 @@ def render():
     if render_btn:
         lines = st.session_state.story["lines"]
         beats = st.session_state.analysis["beat_times"]; duration = st.session_state.analysis["duration"]
-        import tempfile, os
+        import tempfile, os, uuid
         with tempfile.NamedTemporaryFile(suffix=os.path.splitext(st.session_state.audio_name)[-1], delete=False) as atmp:
             atmp.write(st.session_state.audio_bytes); atmp.flush(); audio_path = atmp.name
 
@@ -443,16 +450,16 @@ def render():
         for i, line in enumerate(lines):
             mp4_bytes: Optional[bytes] = None
             last_err = None
-            if st.sidebar.session_state.get("Use FREE animated Spaces (real motion)", True) or True:
-                if st.sidebar.session_state.get("Animation mode", "Text→Video (CogVideoX Space)").startswith("Text→Video"):
+            if st.session_state.get('use_free_anim', True) or True:
+                if st.session_state.get('anim_mode', 'Text→Video (CogVideoX Space)').startswith('Text→Video'):
                     try:
-                        mp4_bytes = freeanim_t2v(line, seconds=per_scene, space_id=st.sidebar.session_state.get("T2V Space", "THUDM/CogVideoX-5b"))
+                        mp4_bytes = freeanim_t2v(line, seconds=per_scene, space_id=st.session_state.get('t2v_space', 'THUDM/CogVideoX-5b'))
                     except Exception as e:
                         last_err = str(e)
                 else:
                     still = fallback_image_for_line(line)
                     try:
-                        mp4_bytes = freeanim_i2v(still, seconds=per_scene, space_id=st.sidebar.session_state.get("I2V Space", "stabilityai/stable-video-diffusion-img2vid"))
+                        mp4_bytes = freeanim_i2v(still, seconds=per_scene, space_id=st.session_state.get('i2v_space', 'stabilityai/stable-video-diffusion-img2vid'))
                     except Exception as e:
                         last_err = str(e)
             if not mp4_bytes and last_err:
