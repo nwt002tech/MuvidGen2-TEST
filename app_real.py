@@ -7,7 +7,7 @@ if not hasattr(_Image, "ANTIALIAS"):
     except Exception:
         _Image.ANTIALIAS = 1
 
-import os, re, io, uuid, time, tempfile, logging, sys, subprocess, json
+import os, re, io, uuid, time, tempfile, logging, sys, subprocess
 from dataclasses import dataclass
 from typing import List, Optional
 import numpy as np
@@ -137,7 +137,11 @@ def analyze_audio(file_bytes: bytes, sr_target: int = 44100) -> AudioAnalysis:
     return AudioAnalysis(duration=duration, tempo_bpm=bpm, beat_times=[float(t) for t in beat_times])
 
 # --------------------------- FreeAnim via Hugging Face Spaces ----------------------------
-from gradio_client import Client, handle_file
+from gradio_client import Client
+try:
+    from gradio_client import file as gc_file
+except Exception:
+    def gc_file(path): return path  # fallback
 
 def _space_client(space_id: str) -> Optional[Client]:
     try:
@@ -148,7 +152,6 @@ def _space_client(space_id: str) -> Optional[Client]:
 
 def _first_predict_endpoint(meta: dict, want_image: bool=False, want_text: bool=False) -> Optional[str]:
     apis = meta.get("endpoints", []) or meta.get("named_endpoints", [])
-    # If dict mapping
     if isinstance(apis, dict):
         for name, schema in apis.items():
             inputs = (schema.get("inputs") if isinstance(schema.get("inputs"), list) else []) if isinstance(schema, dict) else []
@@ -156,7 +159,6 @@ def _first_predict_endpoint(meta: dict, want_image: bool=False, want_text: bool=
             if want_text and any(t in ("textbox","text","string") for t in types): return name
             if want_image and any(t in ("image","filepath","numpy","pil") for t in types): return name
         return None
-    # If list of endpoint dicts
     for ep in apis:
         if not isinstance(ep, dict): continue
         schema = ep.get("schema") or ep.get("config") or ep
@@ -215,8 +217,8 @@ def freeanim_i2v(image: Image.Image, seconds: int = 4, space_id: str = "stabilit
     tmp_img = os.path.join(tempfile.gettempdir(), f"svd_{uuid.uuid4().hex}.png")
     image.save(tmp_img)
     candidates = [
-        {"image": handle_file(tmp_img), "fps": 12, "motion_bucket_id": 64, "seed": 0},
-        {"image": handle_file(tmp_img)},
+        {"image": gc_file(tmp_img), "fps": 12, "motion_bucket_id": 64, "seed": 0},
+        {"image": gc_file(tmp_img)},
     ]
     for payload in candidates:
         try:
